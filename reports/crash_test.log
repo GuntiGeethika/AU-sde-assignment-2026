@@ -1,0 +1,16 @@
+kill #1 after 3.4s at 2027-01-04T15:15:00+05:30
+kill #2 after 3.7s at 2027-01-07T06:45:00+05:30
+kill #3 after 3.7s at 2027-01-09T11:30:00+05:30
+kill #4 after 3.7s at 2027-01-11T11:00:00+05:30
+kill #5 after 2.3s at 2027-01-12T15:00:00+05:30
+kill #6 after 1.7s at 2027-01-13T11:45:00+05:30
+final run exit=0
+duplicate applies of one proposal: 0
+approvals in sim: 10 | tracked by controller: 10
+approvals left pending/approved-unapplied: []
+restarts recorded in audit log: 6
+recoveries: []
+17 applied — beneficial: 8, neutral: 9
+    "expired": 0
+  "apply_conflicts": 0,
+  "lapsed": 0,
