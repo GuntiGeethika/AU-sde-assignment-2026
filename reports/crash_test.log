@@ -1,17 +1,17 @@
-kill #1 after 2.0s at 2027-01-04T00:00:00+05:30
-kill #2 after 3.1s at 2027-01-04T09:30:00+05:30
-kill #3 after 3.8s at 2027-01-06T18:45:00+05:30
-kill #4 after 1.7s at 2027-01-07T18:00:00+05:30
-kill #5 after 2.8s at 2027-01-09T06:30:00+05:30
-kill #6 after 3.0s at 2027-01-10T17:45:00+05:30
+kill #1 after 2.2s at 2027-01-04T00:00:00+05:30
+kill #2 after 3.6s at 2027-01-04T20:45:00+05:30
+kill #3 after 2.1s at 2027-01-06T06:15:00+05:30
+kill #4 after 3.7s at 2027-01-08T08:45:00+05:30
+kill #5 after 3.1s at 2027-01-09T21:00:00+05:30
+kill #6 after 2.0s at 2027-01-10T18:00:00+05:30
 final run exit=0
 duplicate applies of one proposal: 0
-approvals in sim: 13 | tracked by controller: 13
+approvals in sim: 16 | tracked by controller: 16
 approvals left pending/approved-unapplied: []
-approved but deliberately not applied (config moved, stale): []
+approved but deliberately not applied (config moved, stale): ['apr_00006']
 restarts recorded in audit log: 5
 recoveries: []
-21 applied — beneficial: 9, neutral: 12
+19 applied — beneficial: 9, neutral: 10
     "expired": 0
   "apply_conflicts": 0,
   "lapsed": 0,

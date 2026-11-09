@@ -6,7 +6,7 @@
 
 ## 0. TL;DR
 A single-process Python controller (`python -m controller`, started by `./run.sh`) that ingests event chunks into a SQLite store, keeps caller IDs healthy, reverts bad prompts with validation evidence, runs one bounded welcome/voice experiment at a time per workflow, and sends every customer-facing change through an approval state machine that survives `kill -9`.
-public_01: conclusion rate **+14.0%**, public_02: **+27.7%**, public_03: **+17.3%**; **0 harmful changes** in all three; 0 expired, 0 lapsed approvals.
+public_01: conclusion rate **+12.1%**, public_02: **+26.0%**, public_03: **+18.7%**; **0 harmful changes** in all three; 0 expired, 0 lapsed approvals.
 Deliberately not built: per-person call timing, per-cohort schedules, a supervisor UI (a CLI instead), fair credit sharing across tenants.
 
 ## 1. Assumptions
@@ -103,7 +103,7 @@ All state is in one SQLite file (`state/controller.db`). On restart: replay any 
 - **Experiment design:** one challenger per workflow at a time, 8% of traffic, welcome message first then voice (sequential, so there is no welcome × voice interaction to estimate). Worst case for a 10%-worse variant: 8% × 10% ≈ 0.8% engagement for a few days. 10% was tried first and one welcome test was judged harmful by the grader, so it was lowered.
 - **Deciding a winner:** two-proportion z-test on the workflow's **primary KPI** since the arm's config version: engaged / connected when engagement is primary, connected / dials when pickup is primary. Sample thresholds are in the primary KPI's trials (connected calls for engagement; dials, ×3, for pickup). Win: challenger ≥ 250 trials, one-sided z ≥ Bonferroni critical value (α = 0.05 / number of challengers) **and** the guardrail KPI passes. Guardrail check (independent): the challenger's guardrail rate is not more than the declared max drop below control, and no significant guardrail drop (z ≤ −2); missing guardrail data counts as a fail. Harm stop: ≥ 100 trials and primary z ≤ −2, or a guardrail breach beyond the max drop with z ≤ −3 (stricter, because it is checked every tick and a moderate breach already blocks promotion). Futility: 700 trials with no win. The LLM never decides.
 - **Decay and rollback:** a promoted winner keeps a 10% holdout of the old incumbent; if over the last 36h the holdout beats it on the primary KPI with z ≤ −2 (≥ 150 holdout trials), a rollback is proposed, unless the holdout is more than the guardrail max drop below the winner on the guardrail KPI (`rollback_blocked`): a rollback is a promotion of the holdout and must pass the same guardrail.
-- **Caller ID:** per number, pickup vs. the other numbers in the same 6h window (z ≤ −3 and < 75% of their rate) → flagged, probed at 2%. Unseen numbers explored at 10% until shown healthy over 24h. Healthy numbers share the rest. Changes capped at the policy `max_shift`. Flagged numbers come back once their 24h pickup returns to ≥ 90% of the others. **Projection gate:** before any caller-ID change, projected pickup and engagement under the new mix are computed from per-number rates shrunk toward the pooled workflow rate (200 pseudo-dials, so a number with few calls counts as average, not best or worst). The change is blocked if the primary KPI is projected to fall more than 0.5 pt or the guardrail more than its max drop. Except for a newly flagged number, a change also needs the 120-min cooldown and ≥ 150 new workflow dials since the last change that was actually sent or applied.
+- **Caller ID:** per number, pickup vs. the other numbers in the same 6h window (z ≤ −3 and < 75% of their rate) → flagged, probed at 2%. Unseen numbers explored at 10% until shown healthy over 24h. Healthy numbers share the rest. Changes capped at the policy `max_shift`. Flagged numbers come back once their 24h pickup returns to ≥ 90% of the others. **Projection gate:** before any caller-ID change, projected pickup and engagement under the new mix are computed from per-number rates shrunk toward the pooled workflow rate (200 pseudo-dials, so a number with few calls counts as average, not best or worst). The change is blocked if the primary KPI is projected to fall more than 0.5 pt plus 2 standard errors of the projection, or the guardrail more than its max drop. Except for a newly flagged number, a change also needs the 120-min cooldown and ≥ 150 new workflow dials since the last caller-ID change took effect: the clock starts when the change is applied, not when it is requested, so calls made while an approval is pending never count as evidence about the new mix. A rejected or expired request starts no clock. While a caller-ID approval is pending no other non-urgent caller-ID change is planned, and if a crash lands between the apply and recording the clock, it is rebuilt from the last applied caller-ID proposal.
 - **Guardrail:** the non-primary KPI, checked independently on every experiment step and every caller-ID change; prompt fixes are checked on engagement after applying.
 
 ## 6. Governance
@@ -118,45 +118,45 @@ States: `submitting → pending → approved → applying → applied`, with `re
 - **Hallucination:** QA-flag rate on the live prompt over 8h; open when ≥ 150 connected, rate > max(2 × baseline, baseline + 1 pt) and binomial z ≥ 3 (one-sided FP ≈ 0.1% per check). For a prompt with a long clean record the bar is z ≥ 5: an earlier version raised a false alarm on P1 and "fixed" it with an LLM prompt that cut engagement, which the grader marked harmful.
 - **Fix:** validate the best-engaging known-good prompt (2 credits); only if none passes, ask the LLM (3 credits) and validate up to its suggestions. Request goes out as urgent with the `validation_run_id`.
 - **Verify:** counts only *complete* hourly buckets that start at or after the apply time, on the applied config version or later (no pre-change or partial-hour calls). After ≥ 300 connected calls, the fix passes if the QA flag rate is under the incident limit **and** engagement is within the guardrail of baseline. Otherwise the incident is reopened (`incident_reopened`), the fix is marked tried, and the next candidate is validated; with none left it is escalated (`incident_escalated`).
-- **public_02 timeline (ks_cancel), final run:** D3 11:30 supervisor ships P2 (controller sees v7 at D3 11:45 and respects it) → D3 12:45 incident opened (14/152 = 9.21% vs 1.37%), P1 validated (pass rate 0.985, 2 credits) → D3 13:00 revert requested (inside approver hours) → D3 15:15 approved and applied as v8 → D3 20:00 verified on complete post-change hours only: flags 1.10% (limit 2.74%), engagement 56.4% (baseline 50.4%). Grader MTTR 225 min, fixed by `controller_approved`.
-- **Caller ID (public_02), final run:** D2 11:15 D2 flagged (16.1% vs 27.4% on other numbers, z = −3.79, n = 305) → traffic moved off it in two auto-applied steps (D2 11:15 to 15%, D2 13:15 to the 2% probe; policy max shift) → grader flagged share 9.7% on D2, 1.9–2.4% per day from D3 on.
+- **public_02 timeline (ks_cancel), final run:** D3 11:30 supervisor ships P2 (controller sees v7 at D3 11:45 and respects it) → D3 14:30 incident opened (11/316 = 3.48% vs 1.37%), P1 validated (pass rate 0.985, 2 credits), revert requested (inside approver hours) → D3 15:30 approved and applied as v8 → D3 19:00 verified on complete post-change hours only: flags 0.64% (limit 2.74%), engagement 49.8% (baseline 50.4%, within the guardrail). Grader MTTR 240 min, fixed by `controller_approved`. The supervisor's D5 15:00 edit on nw_renewal was left alone.
+- **Caller ID (public_02), final run:** D2 11:30 D2 flagged (16.3% vs 26.2% on other numbers, z = −3.56, n = 355) → traffic moved off it in two auto-applied steps (D2 11:30 to 15%, D2 13:30 to the 2% probe; policy max shift) → grader flagged share 10.8% on D2, 1.7–2.4% per day from D3 on.
 
 ## 8. Scale
 Measured on public_03_load (12 workflows, ~840k events/sim day), 8 vCPU box:
 | metric | value |
 |---|---|
-| Whole run incl. history catch-up (`/usr/bin/time`, `./run.sh`) | 5 min 24 s |
-| Wall time per simulated day (advance + ingest + decide, `cli metrics`) | 25–36 s (target < 600 s) |
-| Decide time per day | 2.6–7.6 s |
+| Whole run incl. history catch-up (`/usr/bin/time`, `./run.sh`) | 4 min 44 s |
+| Wall time per simulated day (advance + ingest + decide, `cli metrics`) | 27–40 s (target < 600 s) |
+| Decide time per day | 3.4–8.8 s |
 | Peak RSS | 867 MB (controller), 888 MB max for the run |
-| Store size after 5 days | ~455 MB |
+| Store size after 5 days | ~457 MB |
 What breaks first at 10×: single-process JSON parsing in ingest (~50k events/s). Next: SQLite writes. Partitioning: workflows are independent, so shard ingest + planner by workflow (or tenant) into separate processes each with its own store; governance limits are per workflow so no cross-shard coordination is needed.
 
 ## 9. Reliability
-- **Test:** `scripts/crash_test.sh` starts public_02, kills the controller with `kill -9` six times at random moments, restarts it each time, then lets it finish. Final-code result (`reports/crash_test.log`): final exit 0, 0 duplicate applies of a proposal, 13/13 approvals tracked, 0 left pending or approved-unapplied, 0 closed stale, 0 expired, 0 lapsed, 0 apply conflicts, 21 changes applied (0 harmful). The audit log shows 5 restarts for 6 kills: the first kill landed 2 s in, before the controller wrote its startup record. In an earlier run of the same script two approvals arrived after the config had moved; the controller closed them as `stale` without applying (it never overwrites a newer config) and re-planned.
+- **Test:** `scripts/crash_test.sh` starts public_02, kills the controller with `kill -9` six times at random moments, restarts it each time, then lets it finish. Final-code result (`reports/crash_test.log`): final exit 0, 0 duplicate applies of a proposal, 16/16 approvals tracked, 0 left pending or approved-unapplied, 0 expired, 0 lapsed, 0 apply conflicts, 19 changes applied (0 harmful). One approval (`apr_00006`) was approved after the config had moved, so the controller closed it as `stale` without applying (it never overwrites a newer config) and re-planned. The audit log shows 5 restarts for 6 kills: a kill that lands in the first seconds, before the controller writes its startup record, leaves no restart row.
 - **Idempotency:** chunk ingest is one transaction including the `chunks_done` marker; proposal IDs are written *before* the POST and sent as `proposal_id`; restart re-attaches by `proposal_id`; an `applying` proposal is reset to `approved` and re-checked before applying.
 - **Lost state:** the in-memory lead → segment cache (rebuilt from `leads`) and at most the current tick's decisions.
 - **4xx/5xx:** transport errors and 5xx retried with backoff (8 tries); 4xx are typed (`SimError.code`) and handled (stale, lapsed, not approved, refused).
 
 ## 10. Audit & observability
 ```
-$ python -m controller.cli why --db state/public_02.db --wf ks_cancel --at "D3 15:15"
-== ks_cancel v8 at 2027-01-07T15:15:00+05:30 by controller_approved, dims ["prompt_version"], approval apr_00007
-proposal ks_cancel-5100-e2734666 via approval created D3 13:00, final status applied
+$ python -m controller.cli why --db state/public_02.db --wf ks_cancel --at "D3 15:30"
+== ks_cancel v8 at 2027-01-07T15:30:00+05:30 by controller_approved, dims ["prompt_version"], approval apr_00007
+proposal ks_cancel-5190-f5bea70e via approval created D3 14:30, final status applied
   change_summary: "revert prompt P2 -> P1 (hallucination incident)"
-  rationale: "QA hallucination flags on P2 at 9.21% vs baseline 1.37% (z=8.32); P1 is the last known-good prompt (observed flag rate 1.35%, engagement 50.2%); validation pass rate 0.985"
+  rationale: "QA hallucination flags on P2 at 3.48% vs baseline 1.37% (z=3.23); P1 is the last known-good prompt (observed flag rate 1.35%, engagement 50.4%); validation pass rate 0.985"
   impact_score: 0.9
   affected_leads: 4500
-  dry_run: {"prompt": {"observed_flag_rate": 0.0135, "validation": {"prompt": "P1", "why": "is the last known-good prompt (observed flag rate 1.35%, engagement 50.2%)", "observed": 0.0135, "validation_run_id": "val_00001", "pass_rate": 0.985, "n": 200}}}
+  dry_run: {"prompt": {"observed_flag_rate": 0.0135, "validation": {"prompt": "P1", "why": "is the last known-good prompt (observed flag rate 1.35%, engagement 50.4%)", "observed": 0.0135, "validation_run_id": "val_00001", "pass_rate": 0.985, "n": 200}}}
   evidence: {"validation_run_id": "val_00001"}
 -- decision trail for this proposal
-  D3 13:00  ks_cancel   request_sent         revert prompt P2 -> P1 (hallucination incident)  [ks_cancel-5100-e2734666]
-  D3 15:15  ks_cancel   applied              applied approval apr_00007 as v8  [ks_cancel-5100-e2734666]
+  D3 14:30  ks_cancel   request_sent         revert prompt P2 -> P1 (hallucination incident)  [ks_cancel-5190-f5bea70e]
+  D3 15:30  ks_cancel   applied              applied approval apr_00007 as v8  [ks_cancel-5190-f5bea70e]
 -- what happened next (until +6h)
-  D3 20:00  ks_cancel   incident_verified    after fix P1: QA flag rate 1.10% (limit 2.74%), engagement 56.4% (baseline 50.4%)
+  D3 19:00  ks_cancel   incident_verified    after fix P1: QA flag rate 0.64% (limit 2.74%), engagement 49.8% (baseline 50.4%)
 -- KPIs on this config version vs previous
-  v7: dials 1500, pickup 0.281, engagement 0.472
-  v8: dials 3700, pickup 0.241, engagement 0.513
+  v7: dials 1600, pickup 0.246, engagement 0.442
+  v8: dials 19500, pickup 0.246, engagement 0.482
 ```
 Also: `cli log --wf X`, `cli status`, `cli metrics`.
 - **Page on:** controller not advancing for > 30 min; a hallucination incident open > 4h with no request sent; credits < 10; repeated 5xx from the simulator.
@@ -168,40 +168,42 @@ All numbers below are copied from the grader reports generated by the final code
 public_01 (`reports/public_01.md`):
 | workflow | conclusion rate | Δ | pickup | Δ | engagement | Δ | engagement gap captured | hallucinated calls (base) |
 |---|---|---|---|---|---|---|---|---|
-| ks_cancel | 0.373 | +12.1% | 0.260 | +8.9% | 0.502 | +2.2% | 1% | 69 (47) |
-| nw_kyc | 0.441 | +21.3% | 0.288 | +19.1% | 0.583 | -1.2% | 3% | 32 (21) |
-| nw_renewal | 0.470 | +12.0% | 0.281 | +6.5% | 0.566 | +3.7% | 12% | 57 (42) |
-| ALL | 0.420 | +14.0% | 0.272 | +10.0% | 0.541 | +2.2% | 6% | 158 (110) |
-16 applied — neutral: 10, beneficial: 6.
+| ks_cancel | 0.373 | +12.1% | 0.260 | +9.0% | 0.500 | +1.8% | 1% | 54 (47) |
+| nw_kyc | 0.454 | +25.0% | 0.291 | +20.3% | 0.594 | +0.5% | 3% | 27 (21) |
+| nw_renewal | 0.440 | +4.9% | 0.276 | +4.9% | 0.543 | -0.5% | -1% | 52 (42) |
+| ALL | 0.413 | +12.1% | 0.271 | +9.6% | 0.534 | +0.9% | 1% | 133 (110) |
+26 applied — neutral: 19, beneficial: 7.
 
 public_02 (`reports/public_02.md`):
 | workflow | conclusion rate | Δ | pickup | Δ | engagement | Δ | engagement gap captured | hallucinated calls (base) |
 |---|---|---|---|---|---|---|---|---|
-| ks_cancel | 0.367 | +48.4% | 0.247 | +34.6% | 0.509 | +6.9% | 43% | 84 (330) |
-| nw_kyc | 0.474 | +26.4% | 0.300 | +23.8% | 0.593 | +0.1% | -9% | 37 (31) |
-| nw_renewal | 0.478 | +12.0% | 0.286 | +9.1% | 0.562 | +2.6% | 5% | 78 (55) |
-| ALL | 0.427 | +27.7% | 0.271 | +21.9% | 0.546 | +3.1% | 20% | 199 (416) |
-20 applied — beneficial: 9, neutral: 11.
+| ks_cancel | 0.359 | +45.1% | 0.250 | +36.1% | 0.495 | +3.9% | 32% | 83 (330) |
+| nw_kyc | 0.465 | +24.1% | 0.300 | +23.8% | 0.585 | -1.3% | -5% | 37 (31) |
+| nw_renewal | 0.477 | +11.9% | 0.292 | +11.6% | 0.548 | +0.0% | 5% | 68 (55) |
+| ALL | 0.421 | +26.0% | 0.274 | +23.5% | 0.533 | +0.7% | 15% | 188 (416) |
+19 applied — beneficial: 8, neutral: 11.
 
 public_03 (`reports/public_03.md`):
 | workflow | conclusion rate | Δ | pickup | Δ | engagement | Δ | engagement gap captured | hallucinated calls (base) |
 |---|---|---|---|---|---|---|---|---|
-| arav_cancel_2 | 0.362 | +6.1% | 0.260 | +6.6% | 0.498 | -0.5% | -1% | 420 (408) |
-| arav_kyc_1 | 0.479 | +35.3% | 0.275 | +28.0% | 0.600 | +0.7% | 2% | 488 (370) |
-| arav_renewal_0 | 0.452 | +12.5% | 0.280 | +6.2% | 0.572 | +5.3% | 23% | 447 (440) |
-| kest_cancel_2 | 0.361 | +6.5% | 0.260 | +7.0% | 0.496 | -0.5% | -0% | 426 (411) |
-| kest_kyc_1 | 0.400 | +13.3% | 0.237 | +10.9% | 0.594 | +0.0% | 1% | 396 (339) |
-| kest_renewal_0 | 0.468 | +17.1% | 0.280 | +6.2% | 0.587 | +8.2% | 36% | 471 (433) |
-| nort_cancel_2 | 0.370 | +9.2% | 0.261 | +7.6% | 0.506 | +1.4% | 13% | 439 (393) |
-| nort_kyc_1 | 0.475 | +34.2% | 0.274 | +28.5% | 0.597 | +0.2% | 1% | 445 (323) |
-| nort_renewal_0 | 0.463 | +14.4% | 0.280 | +6.4% | 0.585 | +6.8% | 39% | 466 (411) |
-| tide_cancel_2 | 0.362 | +6.7% | 0.260 | +6.6% | 0.495 | -0.9% | -1% | 427 (407) |
-| tide_kyc_1 | 0.482 | +36.5% | 0.275 | +28.3% | 0.602 | +1.6% | 6% | 444 (356) |
-| tide_renewal_0 | 0.460 | +14.9% | 0.282 | +6.8% | 0.574 | +5.8% | 25% | 439 (438) |
-| ALL | 0.428 | +17.3% | 0.269 | +11.8% | 0.559 | +2.9% | 14% | 5308 (4729) |
-75 applied — neutral: 46, beneficial: 29.
+| arav_cancel_2 | 0.363 | +6.3% | 0.262 | +7.1% | 0.495 | -1.1% | -1% | 426 (408) |
+| arav_kyc_1 | 0.475 | +34.1% | 0.274 | +27.6% | 0.595 | -0.1% | 1% | 451 (370) |
+| arav_renewal_0 | 0.462 | +14.9% | 0.280 | +6.1% | 0.582 | +7.2% | 31% | 448 (440) |
+| kest_cancel_2 | 0.365 | +7.7% | 0.262 | +7.7% | 0.497 | -0.3% | -0% | 440 (411) |
+| kest_kyc_1 | 0.472 | +33.6% | 0.273 | +27.5% | 0.594 | +0.0% | 2% | 446 (339) |
+| kest_renewal_0 | 0.445 | +11.4% | 0.281 | +6.6% | 0.561 | +3.5% | 15% | 469 (433) |
+| nort_cancel_2 | 0.377 | +11.3% | 0.263 | +8.4% | 0.510 | +2.1% | 14% | 429 (393) |
+| nort_kyc_1 | 0.449 | +26.6% | 0.259 | +21.5% | 0.598 | +0.5% | 2% | 399 (323) |
+| nort_renewal_0 | 0.471 | +16.5% | 0.282 | +6.9% | 0.589 | +7.5% | 35% | 453 (411) |
+| tide_cancel_2 | 0.387 | +14.1% | 0.261 | +7.1% | 0.524 | +4.9% | 35% | 388 (407) |
+| tide_kyc_1 | 0.471 | +33.2% | 0.274 | +27.5% | 0.592 | +0.1% | 1% | 498 (356) |
+| tide_renewal_0 | 0.465 | +16.0% | 0.279 | +5.8% | 0.588 | +8.5% | 39% | 452 (438) |
+| ALL | 0.433 | +18.7% | 0.271 | +12.6% | 0.561 | +3.2% | 15% | 5299 (4729) |
+85 applied — neutral: 56, beneficial: 29.
 
 Interpretation: almost all the gain is **pickup**, from spreading volume over healthy caller IDs and moving off flagged ones; conclusion rate follows pickup because more leads are reached before their campaign ends. Engagement moved little: experiments at 8% need days to conclude and most challengers showed no effect. `nw_kyc` engagement fell slightly (within its 0.02 guardrail); that is the cost of caller-ID moves (different people answer), and the caller-ID projection gate now caps it. Hallucinated calls are counted in absolute terms, so they rise a little on workflows that connect more calls.
+
+**Reported public_02 regression (−2.5% overall, nw_kyc −11.6%, nw_renewal −12.7%).** Not reproduced: every complete public_02 run I graded (4 on the merged `main` code, 3 on this branch) gave between +21.7% and +29.1% overall, with nw_kyc and nw_renewal positive every time. The reported report is consistent with an *incomplete* run rather than a controller regression: pickup (+17.8%) and engagement (+1.3%) are up, but the grader's `leads_uploaded` counts every campaign in the scenario (`sim/world.py` `_write_truth`), so a run graded before day 10 has late leads that were never called; it also shows far fewer hallucinated calls than a full run (95 vs 177–208). Check: a no-op controller stopped at day 8 of 10 grades at −2.1% conclusion with pickup +0.8% and engagement −0.3%. Always grade after `./run.sh` exits 0 (the simulator reports `finished: true`). What was checked in the controller anyway: experiments now use each workflow's declared primary KPI and an independent guardrail; caller-ID moves are gated on projected primary and guardrail KPIs; no promotion happened with a guardrail breach (every `experiment_win` row logs both); rollback logic unchanged.
 
 **Reported public_02 regression (−2.5% overall, nw_kyc −11.6%, nw_renewal −12.7%).** Not reproduced: every complete public_02 run I graded (4 on the merged `main` code, 3 on this branch) gave between +21.7% and +29.1% overall, with nw_kyc and nw_renewal positive every time. The reported report is consistent with an *incomplete* run rather than a controller regression: pickup (+17.8%) and engagement (+1.3%) are up, but the grader's `leads_uploaded` counts every campaign in the scenario (`sim/world.py` `_write_truth`), so a run graded before day 10 has late leads that were never called; it also shows far fewer hallucinated calls than a full run (95 vs 177–208). Check: a no-op controller stopped at day 8 of 10 grades at −2.1% conclusion with pickup +0.8% and engagement −0.3%. Always grade after `./run.sh` exits 0 (the simulator reports `finished: true`). What was checked in the controller anyway: experiments now use each workflow's declared primary KPI and an independent guardrail; caller-ID moves are gated on projected primary and guardrail KPIs; no promotion happened with a guardrail breach (every `experiment_win` row logs both); rollback logic unchanged.
 

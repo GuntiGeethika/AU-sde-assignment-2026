@@ -86,6 +86,8 @@ class Planner:
     # ------------------------------------------------------------------ proposal outcomes
     def on_closed(self, p, status):
         self.cfg.pop(p["wf"], None)
+        if status == "applied" and any(it.get("key") == "caller_id" for it in p["intents"]):
+            self._mark_did_change(p["wf"], p["proposal_id"])
         for it in p["intents"]:
             if it.get("exp_id"):
                 self._exp_closed(it, status, p.get("applied_version"))
@@ -151,9 +153,8 @@ class Planner:
         # Only operational dims (caller ID, schedule) ever take the auto-apply path.
         operational = dims <= {"caller_id", "schedule"}
         if operational and self.gov.auto_allowed(wid, dims, shift):
-            if self.gov.auto_apply(wid, cur, new, intents, "; ".join(i["summary"] for i in intents),
-                                   {"stats": [i.get("evidence") for i in intents]}):
-                self._mark_sent(wid, intents)
+            self.gov.auto_apply(wid, cur, new, intents, "; ".join(i["summary"] for i in intents),
+                                {"stats": [i.get("evidence") for i in intents]})
             return
         ok, why = self.gov.can_request(wid, urgent=urgent)
         if not ok:
@@ -180,7 +181,6 @@ class Planner:
         for k in [r[0] for r in self.s.q("SELECT k FROM kv WHERE k LIKE ?", (f"deferred:{wid}:%",))]:
             self.s.db.execute("DELETE FROM kv WHERE k=?", (k,))
         if pid:
-            self._mark_sent(wid, intents)
             for it in intents:
                 if it.get("exp_id"):
                     self.s.db.execute("UPDATE experiments SET status=? WHERE exp_id=?",
@@ -190,11 +190,17 @@ class Planner:
                     inc.update(status="fix_req", proposal_id=pid)
                     self.s.set(f"incident:{wid}", inc)
 
-    def _mark_sent(self, wid, intents):
-        """Start the caller-ID cooldown / new-evidence clock only once a change was actually sent or applied."""
-        for it in intents:
-            if it.get("key") == "caller_id" and it.get("mark"):
-                self.s.set(f"did_last_change:{wid}", it["mark"])
+    def _mark_did_change(self, wid, pid):
+        """Start the caller-ID cooldown / new-evidence clock when a caller-ID change actually takes effect, so calls
+        made while an approval was pending never count as evidence about the new mix."""
+        total = self.s.one("SELECT SUM(dials) FROM agg WHERE wf=?", (wid,))[0] or 0
+        mark = {"minute": self.s.now_minute, "dials": total, "proposal_id": pid}
+        self.s.set(f"did_last_change:{wid}", mark)
+        return mark
+
+    def _did_pending(self, wid) -> bool:
+        return any(any(it.get("key") == "caller_id" for it in self.gov.row(pid)["intents"])
+                   for pid in self.gov.open_for(wid))
 
     # ------------------------------------------------------------------ caller ID health (C5)
     def caller_id(self, wid, cur):
@@ -243,7 +249,14 @@ class Planner:
         if not isinstance(last, dict):
             last = {"minute": last if last is not None else -10**9, "dials": None}
         total = self.s.one("SELECT SUM(dials) FROM agg WHERE wf=?", (wid,))[0] or 0
+        applied = self.s.one("SELECT proposal_id FROM proposals WHERE wf=? AND status='applied' AND intents LIKE ? "
+                             "ORDER BY rowid DESC LIMIT 1", (wid, '%"key": "caller_id"%'))
+        if applied and last.get("proposal_id") != applied[0]:
+            # applied but the clock was never started (crash between apply and on_closed): start it now
+            last = self._mark_did_change(wid, applied[0])
         if dist_tv < P.DID_MIN_TV_TO_ACT:
+            return None
+        if not new_flag and self._did_pending(wid):
             return None
         if not new_flag and (self.s.now_minute - last["minute"] < P.DID_COOLDOWN_MIN or
                              (last["dials"] is not None and total - last["dials"] < P.DID_MIN_NEW_DIALS)):
@@ -269,7 +282,7 @@ class Planner:
                 "summary": f"caller-ID mix {cur_d} -> {step}",
                 "rationale": f"status {status}; spread volume over healthy numbers, probe flagged ones at "
                              f"{P.DID_PROBE_SHARE:.0%}, explore unseen ones at {P.DID_EXPLORE_SHARE:.0%}",
-                "impact": 0.6 if new_flag else 0.3, "mark": {"minute": self.s.now_minute, "dials": total},
+                "impact": 0.6 if new_flag else 0.3,
                 "dry_run": {"pickup_by_caller_id_24h": pick, "dials_24h": {d: (w24.get(d) or (0,))[0] for d in opts},
                             "flagged": new_flag, "projection": proj},
                 "evidence": {"status": status, "flags": new_flag}}

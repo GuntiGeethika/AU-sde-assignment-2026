@@ -134,8 +134,39 @@ def test_no_repeat_caller_id_change_without_new_dials(tmp_path):
     it = pl.caller_id("k", cur)
     assert it["dim"] == "caller_id"
     assert s.get("did_last_change:k")["dials"] == 0       # a computed-but-unsent change does not reset the clock
-    pl._mark_sent("k", [it])
-    assert s.get("did_last_change:k")["dials"] == total
+    pl.on_closed({"wf": "k", "proposal_id": "p1", "intents": [it]}, "rejected")
+    assert s.get("did_last_change:k")["dials"] == 0       # a rejected request changed nothing
+    s.now_minute += 240
+    add(s, "k", "W1", 800, 240, 120, did="D1", hour=12)    # calls made while the approval was pending
+    pl.on_closed({"wf": "k", "proposal_id": "p2", "intents": [it]}, "applied")
+    mark = s.get("did_last_change:k")
+    assert mark["minute"] == s.now_minute and mark["dials"] == total + 800   # clock starts at apply, not request
+    assert pl.caller_id("k", cur) is None
+
+
+def test_caller_id_suppressed_while_its_approval_is_pending(tmp_path):
+    pl, s = planner(tmp_path, wf("k", "engagement_rate"))
+    s.set("did_status:k", {"D1": "healthy", "D2": "healthy", "D3": "healthy"})
+    for d in ("D1", "D2", "D3"):
+        add(s, "k", "W1", 200, 60, 30, did=d, hour=11)
+    cur = {"config": {"allocations": {"default": {"caller_id": {"D1": 1.0}}}}}
+    it = pl.caller_id("k", cur)
+    pl.gov._insert("p1", "k", "approval", 1, {}, {}, [it])
+    pl.gov._set("p1", status="pending")
+    assert pl.caller_id("k", cur) is None
+
+
+def test_lost_caller_id_marker_recovered_from_applied_proposal(tmp_path):
+    pl, s = planner(tmp_path, wf("k", "engagement_rate"))
+    s.set("did_status:k", {"D1": "healthy", "D2": "healthy", "D3": "healthy"})
+    for d in ("D1", "D2", "D3"):
+        add(s, "k", "W1", 200, 60, 30, did=d, hour=11)
+    cur = {"config": {"allocations": {"default": {"caller_id": {"D1": 1.0}}}}}
+    it = pl.caller_id("k", cur)
+    pl.gov._insert("p1", "k", "approval", 1, {}, {}, [it])
+    pl.gov._set("p1", status="applied", applied_version=2)    # crashed before on_closed recorded the change
+    assert pl.caller_id("k", cur) is None
+    assert s.get("did_last_change:k") == {"minute": s.now_minute, "dials": 600, "proposal_id": "p1"}
 
 
 # ---------------------------------------------------------------- 3. governance
