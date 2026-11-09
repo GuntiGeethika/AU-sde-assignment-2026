@@ -29,7 +29,10 @@ apps = httpx.get(f"{url}/approvals").json()
 mine = {r[0] for r in db.execute("SELECT approval_id FROM proposals WHERE approval_id IS NOT NULL")}
 print("duplicate applies of one proposal:", dup)
 print("approvals in sim:", len(apps), "| tracked by controller:", len(mine & {a['approval_id'] for a in apps}))
-print("approvals left pending/approved-unapplied:", [a["approval_id"] for a in apps if a["status"] in ("pending", "approved")])
+closed = dict(db.execute("SELECT approval_id, status FROM proposals WHERE approval_id IS NOT NULL").fetchall())
+left = [a["approval_id"] for a in apps if a["status"] in ("pending", "approved")]
+print("approvals left pending/approved-unapplied:", [a for a in left if closed.get(a) not in ("stale",)])
+print("approved but deliberately not applied (config moved, stale):", [a for a in left if closed.get(a) == "stale"])
 print("restarts recorded in audit log:", db.execute("SELECT COUNT(*) FROM decisions WHERE kind='restart'").fetchone()[0])
 print("recoveries:", db.execute("SELECT summary FROM decisions WHERE kind='recovered'").fetchall())
 PY

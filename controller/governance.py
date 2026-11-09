@@ -13,7 +13,6 @@ import json
 import logging
 import uuid
 
-from . import configs
 from .api import SimError
 from .policy import TENANT_OVERRIDES
 from .store import Store
@@ -54,11 +53,28 @@ class Governance:
         return self.s.one("SELECT COUNT(*) FROM proposals WHERE wf=? AND path='approval' AND status NOT IN "
                           "('failed','abandoned') AND created_minute > ?", (wid, self.s.now_minute - 1440))[0]
 
+    def effective_hours(self, wid) -> tuple[int, int]:
+        """Approver hours narrowed by any stricter tenant override we honour."""
+        lo, hi = self.gov(wid)["approver_hours"]
+        ov = TENANT_OVERRIDES.get(self.wfs[wid]["tenant_id"], {})
+        return max(lo, ov.get("earliest_request_hour", lo)), min(hi, ov.get("latest_request_hour", hi))
+
+    @staticmethod
+    def decision_deadline(now: int, latency: int, lo: int, hi: int) -> int:
+        """Latest minute the approver can decide: `latency` minutes after the request, pushed to the next
+        moment inside their working hours [lo, hi) if it lands outside them (the documented approver model)."""
+        t = now + latency
+        day, mod = divmod(t, 1440)
+        if mod < lo * 60:
+            return day * 1440 + lo * 60
+        if mod >= hi * 60:
+            return (day + 1) * 1440 + lo * 60
+        return t
+
     def can_request(self, wid, urgent=False) -> tuple[bool, str]:
         g = self.gov(wid)
         ov = TENANT_OVERRIDES.get(self.wfs[wid]["tenant_id"], {})
-        lo, hi = g["approver_hours"]
-        lo = max(lo, ov.get("earliest_request_hour", lo))
+        lo, hi = self.effective_hours(wid)
         now = self.s.now_minute
         hour = (now % 1440) // 60
         cap = min(g["max_requests_per_24h"], ov.get("max_requests_per_24h", 99))
@@ -66,18 +82,12 @@ class Governance:
         # keep one slot for incidents when the cap allows it
         if used >= (cap if urgent or cap < 3 else cap - 1):
             return False, f"request budget used ({used}/{cap} in 24h)"
-        if not urgent and self.open_for(wid):
+        if self.open_for(wid):
             return False, "a request is already open for this workflow"
         if not lo <= hour < hi:
-            if not urgent:
-                return False, f"outside approver hours [{lo},{hi})"
-        # worst-case decision time must land before the proposal expires
-        worst = now + g["approver_latency_minutes"][1]
-        day, mod = divmod(worst, 1440)
-        if mod < g["approver_hours"][0] * 60:
-            worst = day * 1440 + g["approver_hours"][0] * 60
-        elif mod >= g["approver_hours"][1] * 60:
-            worst = (day + 1) * 1440 + g["approver_hours"][0] * 60
+            return False, f"outside approver hours [{lo},{hi})"
+        # worst-case decision time must land before the proposal expires, with a tick to spare for applying
+        worst = self.decision_deadline(now, g["approver_latency_minutes"][1], *g["approver_hours"])
         if worst > now + g["proposal_ttl_hours"] * 60 - 15:
             return False, "approver could not decide before the request expires"
         return True, "ok"
@@ -150,6 +160,11 @@ class Governance:
                 self._apply(p)
 
     def _apply(self, p):
+        cur = self.sim.get(f"/workflows/{p['wf']}/config")["version"]
+        if cur != p["base_version"]:  # e.g. a supervisor edit landed after approval: never overwrite it
+            self._close(p, "stale", [f"config moved to v{cur} after we proposed on v{p['base_version']}; "
+                                     "not applied"])
+            return
         self._set(p["proposal_id"], status="applying")
         try:
             r = self.sim.post(f"/workflows/{p['wf']}/apply", {"approval_id": p["approval_id"]})

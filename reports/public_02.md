@@ -4,44 +4,48 @@
 
 | workflow | conclusion rate | Δ | pickup | Δ | engagement | Δ | engagement gap captured | hallucinated calls (base) |
 |---|---|---|---|---|---|---|---|---|
-| ks_cancel | 0.365 | +47.3% | 0.248 | +35.1% | 0.503 | +5.6% | 32% | 95 (330) |
-| nw_kyc | 0.463 | +23.6% | 0.297 | +22.7% | 0.585 | -1.2% | -6% | 30 (31) |
-| nw_renewal | 0.475 | +11.3% | 0.286 | +9.1% | 0.556 | +1.4% | 5% | 66 (55) |
-| ALL | 0.422 | +26.3% | 0.271 | +21.9% | 0.540 | +1.8% | 15% | 191 (416) |
+| ks_cancel | 0.367 | +48.4% | 0.247 | +34.6% | 0.509 | +6.9% | 43% | 84 (330) |
+| nw_kyc | 0.474 | +26.4% | 0.300 | +23.8% | 0.593 | +0.1% | -9% | 37 (31) |
+| nw_renewal | 0.478 | +12.0% | 0.286 | +9.1% | 0.562 | +2.6% | 5% | 78 (55) |
+| ALL | 0.427 | +27.7% | 0.271 | +21.9% | 0.546 | +3.1% | 20% | 199 (416) |
 
 ## Changes applied by the controller
 
-16 applied — beneficial: 8, neutral: 8
+20 applied — beneficial: 9, neutral: 11
 
 - nw_renewal v2 (controller_auto) dims=['caller_id'] engageΔ=+0.000 didΔ=+0.035 → **beneficial**
 - ks_cancel v2 (controller_auto) dims=['caller_id'] engageΔ=+0.000 didΔ=+0.018 → **neutral**
-- nw_renewal v3 (controller_approved) dims=['welcome_message'] engageΔ=+0.000 didΔ=+0.000 → **neutral**
 - ks_cancel v3 (controller_approved) dims=['welcome_message'] engageΔ=+0.004 didΔ=+0.000 → **neutral**
-- nw_kyc v2 (controller_approved) dims=['caller_id'] engageΔ=+0.000 didΔ=+0.089 → **beneficial**
+- nw_kyc v2 (controller_approved) dims=['caller_id'] engageΔ=+0.000 didΔ=+0.077 → **beneficial**
+- nw_renewal v3 (controller_approved) dims=['welcome_message'] engageΔ=+0.000 didΔ=+0.000 → **neutral**
 - ks_cancel v4 (controller_auto) dims=['caller_id'] engageΔ=+0.000 didΔ=+0.032 → **beneficial**
+- nw_kyc v3 (controller_approved) dims=['welcome_message'] engageΔ=-0.006 didΔ=+0.000 → **neutral**
 - nw_renewal v4 (controller_auto) dims=['caller_id'] engageΔ=+0.000 didΔ=+0.031 → **beneficial**
 - nw_renewal v5 (controller_auto) dims=['caller_id'] engageΔ=+0.000 didΔ=+0.015 → **neutral**
-- nw_kyc v3 (controller_approved) dims=['welcome_message'] engageΔ=-0.006 didΔ=+0.000 → **neutral**
-- nw_kyc v4 (controller_approved) dims=['caller_id'] engageΔ=+0.000 didΔ=+0.227 → **beneficial**
+- nw_kyc v4 (controller_approved) dims=['caller_id'] engageΔ=+0.000 didΔ=+0.228 → **beneficial**
 - ks_cancel v5 (controller_auto) dims=['caller_id'] engageΔ=+0.000 didΔ=+0.174 → **beneficial**
 - ks_cancel v6 (controller_auto) dims=['caller_id'] engageΔ=+0.000 didΔ=+0.096 → **beneficial**
 - ks_cancel v8 (controller_approved) dims=['prompt_version'] engageΔ=+0.102 didΔ=+0.000 → **beneficial**
-- ks_cancel v9 (controller_approved) dims=['welcome_message'] engageΔ=-0.004 didΔ=+0.000 → **neutral**
-- ks_cancel v10 (controller_approved) dims=['welcome_message'] engageΔ=+0.000 didΔ=+0.000 → **neutral**
-- nw_renewal v7 (controller_approved) dims=['welcome_message'] engageΔ=+0.000 didΔ=+0.000 → **neutral**
+- nw_kyc v5 (controller_approved) dims=['caller_id'] engageΔ=+0.000 didΔ=-0.000 → **neutral**
+- ks_cancel v9 (controller_approved) dims=['welcome_message'] engageΔ=+0.038 didΔ=+0.000 → **beneficial**
+- ks_cancel v10 (controller_approved) dims=['voice'] engageΔ=+0.000 didΔ=+0.000 → **neutral**
+- nw_kyc v6 (controller_approved) dims=['caller_id'] engageΔ=+0.000 didΔ=+0.001 → **neutral**
+- nw_renewal v6 (controller_auto) dims=['caller_id'] engageΔ=+0.000 didΔ=+0.003 → **neutral**
+- nw_kyc v7 (controller_approved) dims=['caller_id'] engageΔ=+0.000 didΔ=-0.007 → **neutral**
+- nw_renewal v8 (controller_approved) dims=['welcome_message'] engageΔ=+0.000 didΔ=+0.000 → **neutral**
 
 ## Governance
 
 ```
 {
-  "approval_requests": 9,
+  "approval_requests": 13,
   "decisions": {
-    "approved": 9,
+    "approved": 13,
     "expired": 0
   },
   "rejection_reasons": {},
-  "applied_via_approval": 9,
-  "auto_applied": 7,
+  "applied_via_approval": 12,
+  "auto_applied": 8,
   "auto_apply_rejected": 0,
   "apply_conflicts": 0,
   "lapsed": 0,
@@ -62,21 +66,21 @@
     "workflow": "ks_cancel",
     "at": "D2 10:00",
     "flagged_did_share_by_day": {
-      "2": 0.084,
-      "3": 0.02,
-      "4": 0.025,
-      "5": 0.022,
+      "2": 0.097,
+      "3": 0.019,
+      "4": 0.022,
+      "5": 0.02,
       "6": 0.02,
-      "7": 0.022,
-      "8": 0.019,
-      "9": 0.019
+      "7": 0.021,
+      "8": 0.024,
+      "9": 0.021
     }
   },
   {
     "type": "supervisor_edit",
     "workflow": "ks_cancel",
     "at": "D3 11:30",
-    "mttr_minutes": 195,
+    "mttr_minutes": 225,
     "fixed_by": "controller_approved"
   },
   {

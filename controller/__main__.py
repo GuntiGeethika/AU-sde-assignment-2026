@@ -4,9 +4,14 @@ from __future__ import annotations
 import argparse
 import logging
 import os
-import resource
 import shutil
+import sys
 import time
+
+try:
+    import resource  # POSIX only
+except ImportError:  # native Windows
+    resource = None
 
 from .api import Sim, SimError
 from .ingest import Ingestor
@@ -15,6 +20,19 @@ from .store import Store
 from .timeutil import label
 
 log = logging.getLogger("controller")
+
+
+def peak_rss_mb() -> float | None:
+    """Peak resident memory in MB, or None when the platform offers no cheap way to read it."""
+    try:
+        if resource is not None:
+            r = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            return r / 1024 / 1024 if sys.platform == "darwin" else r / 1024
+        import psutil  # optional
+        mi = psutil.Process().memory_info()
+        return getattr(mi, "peak_wset", mi.rss) / 1024 / 1024
+    except Exception:
+        return None
 
 
 def open_store(path: str, state: dict) -> Store:
@@ -97,13 +115,13 @@ def main():
         for wid in wfs:
             planner.tick(wid, hourly, state["credits_remaining"])
         w2 = time.time()
-        rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+        rss = peak_rss_mb()
         store.db.execute("INSERT OR REPLACE INTO metrics VALUES(?,?,?,?,?,?,?,?)",
                          (adv["sim_minute"], store.now_ts, w2, events, w1 - w0, w2 - w1,
                           state["credits_remaining"], rss))
         if adv["sim_minute"] % 1440 == 0:
-            log.info("%s events=%d ingest=%.2fs decide=%.2fs credits=%s rss=%.0fMB", store.now_ts, events,
-                     w1 - w0, w2 - w1, state["credits_remaining"], rss)
+            log.info("%s events=%d ingest=%.2fs decide=%.2fs credits=%s rss=%sMB", store.now_ts, events,
+                     w1 - w0, w2 - w1, state["credits_remaining"], "?" if rss is None else f"{rss:.0f}")
     store.decide(None, "finished", f"scenario finished at {label(state['sim_minute'])}")
     log.info("finished")
 

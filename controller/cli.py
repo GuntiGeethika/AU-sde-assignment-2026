@@ -9,7 +9,6 @@ import argparse
 import json
 import sqlite3
 
-from .timeutil import label
 
 
 def minute_of(s: str) -> int:
@@ -88,7 +87,7 @@ def main():
         for d, ev, i, dc, rss, w0, w1, cr in rows:
             wall = w1 - (prev if prev else w0)
             prev = w1
-            print(f"D{d:<3} {ev:<10} {i:8.1f} {dc:9.1f} {wall:7.1f} {rss:11.0f}  {cr}")
+            print(f"D{d:<3} {ev:<10} {i:8.1f} {dc:9.1f} {wall:7.1f} {(f'{rss:.0f}' if rss is not None else 'n/a'):>11}  {cr}")
 
 
 if __name__ == "__main__":

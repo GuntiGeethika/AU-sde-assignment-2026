@@ -11,7 +11,6 @@ from .api import SimError
 from .governance import Governance
 from .stats import binom_z, norm_ppf, rate, tv, two_prop_z
 from .store import Store
-from .timeutil import label
 
 log = logging.getLogger("controller.plan")
 ACTIVE = ("want_start", "start_req", "running", "want_promote", "promote_req", "want_stop", "stop_req")
@@ -152,8 +151,9 @@ class Planner:
         # Only operational dims (caller ID, schedule) ever take the auto-apply path.
         operational = dims <= {"caller_id", "schedule"}
         if operational and self.gov.auto_allowed(wid, dims, shift):
-            self.gov.auto_apply(wid, cur, new, intents, "; ".join(i["summary"] for i in intents),
-                                {"stats": [i.get("evidence") for i in intents]})
+            if self.gov.auto_apply(wid, cur, new, intents, "; ".join(i["summary"] for i in intents),
+                                   {"stats": [i.get("evidence") for i in intents]}):
+                self._mark_sent(wid, intents)
             return
         ok, why = self.gov.can_request(wid, urgent=urgent)
         if not ok:
@@ -180,6 +180,7 @@ class Planner:
         for k in [r[0] for r in self.s.q("SELECT k FROM kv WHERE k LIKE ?", (f"deferred:{wid}:%",))]:
             self.s.db.execute("DELETE FROM kv WHERE k=?", (k,))
         if pid:
+            self._mark_sent(wid, intents)
             for it in intents:
                 if it.get("exp_id"):
                     self.s.db.execute("UPDATE experiments SET status=? WHERE exp_id=?",
@@ -188,6 +189,12 @@ class Planner:
                     inc = self.kv(f"incident:{wid}")
                     inc.update(status="fix_req", proposal_id=pid)
                     self.s.set(f"incident:{wid}", inc)
+
+    def _mark_sent(self, wid, intents):
+        """Start the caller-ID cooldown / new-evidence clock only once a change was actually sent or applied."""
+        for it in intents:
+            if it.get("key") == "caller_id" and it.get("mark"):
+                self.s.set(f"did_last_change:{wid}", it["mark"])
 
     # ------------------------------------------------------------------ caller ID health (C5)
     def caller_id(self, wid, cur):
@@ -232,8 +239,14 @@ class Planner:
         target.update({d: rest / len(healthy) for d in healthy})
         target = configs.norm(target)
         dist_tv = tv(cur_d, target)
-        last = self.kv(f"did_last_change:{wid}", -10**9)
-        if dist_tv < P.DID_MIN_TV_TO_ACT or (not new_flag and self.s.now_minute - last < P.DID_COOLDOWN_MIN):
+        last = self.kv(f"did_last_change:{wid}")
+        if not isinstance(last, dict):
+            last = {"minute": last if last is not None else -10**9, "dials": None}
+        total = self.s.one("SELECT SUM(dials) FROM agg WHERE wf=?", (wid,))[0] or 0
+        if dist_tv < P.DID_MIN_TV_TO_ACT:
+            return None
+        if not new_flag and (self.s.now_minute - last["minute"] < P.DID_COOLDOWN_MIN or
+                             (last["dials"] is not None and total - last["dials"] < P.DID_MIN_NEW_DIALS)):
             return None
         mx = self.wfs[wid]["governance"]["auto_apply"].get("max_shift", 0) if \
             self.wfs[wid]["governance"]["auto_apply"].get("enabled") else 1.0
@@ -242,16 +255,68 @@ class Planner:
             f = mx / dist_tv * 0.999
             step = configs.norm({d: cur_d.get(d, 0) + (target.get(d, 0) - cur_d.get(d, 0)) * f
                                  for d in set(cur_d) | set(target)})
-        self.s.set(f"did_last_change:{wid}", self.s.now_minute)
+        per_did = {d: (w6 if status[d] == "bad" else w24).get(d) for d in opts}
+        pooled = tuple(sum(v[i] for v in w24.values()) for i in range(3))
+        proj = self.did_projection(wid, cur_d, step, per_did, pooled)
+        if not proj["ok"]:
+            key = f"did_blocked:{wid}:{self.s.now_minute // 1440}"
+            if not self.kv(key):
+                self.s.set(key, 1)
+                self.s.decide(wid, "did_change_blocked", f"caller-ID mix {cur_d} -> {step} held: {proj['why']}", proj)
+            return None
         pick = {d: round((w24.get(d) or (0, 0))[1] / max((w24.get(d) or (1, 0))[0], 1), 3) for d in opts}
         return {"type": "alloc", "dim": "caller_id", "cohort": "default", "dist": step, "key": "caller_id",
                 "summary": f"caller-ID mix {cur_d} -> {step}",
                 "rationale": f"status {status}; spread volume over healthy numbers, probe flagged ones at "
                              f"{P.DID_PROBE_SHARE:.0%}, explore unseen ones at {P.DID_EXPLORE_SHARE:.0%}",
-                "impact": 0.6 if new_flag else 0.3,
+                "impact": 0.6 if new_flag else 0.3, "mark": {"minute": self.s.now_minute, "dials": total},
                 "dry_run": {"pickup_by_caller_id_24h": pick, "dials_24h": {d: (w24.get(d) or (0,))[0] for d in opts},
-                            "flagged": new_flag},
+                            "flagged": new_flag, "projection": proj},
                 "evidence": {"status": status, "flags": new_flag}}
+
+    def did_projection(self, wid, cur_d, new_d, per_did: dict, pooled: tuple) -> dict:
+        """Project pickup and engagement under a caller-ID mix. Each number's rates are shrunk toward the pooled
+        workflow rate, so numbers with few (or no) observations count as average rather than as best or worst."""
+        dials, conn, eng = pooled[:3]
+        p_pick = conn / dials if dials else 0.3
+        p_eng = eng / conn if conn else 0.5
+        k = P.DID_PRIOR_DIALS
+
+        def rates(d):
+            dd, dc, de = (per_did.get(d) or (0, 0, 0))[:3]
+            return (dc + k * p_pick) / (dd + k), (de + k * p_pick * p_eng) / (dc + k * p_pick)
+
+        def mix(dist):
+            r = {d: rates(d) for d in dist}
+            pick = sum(p * r[d][0] for d, p in dist.items())
+            return pick, (sum(p * r[d][0] * r[d][1] for d, p in dist.items()) / pick if pick else 0)
+
+        def se(i):
+            """Standard error of the projected change in KPI i (0 pickup, 1 engagement) from per-number noise."""
+            v = 0.0
+            for d in set(cur_d) | set(new_d):
+                dd, dc, _ = (per_did.get(d) or (0, 0, 0))[:3]
+                n = dd + k if i == 0 else dc + k * p_pick
+                r = rates(d)[i]
+                v += (new_d.get(d, 0) - cur_d.get(d, 0)) ** 2 * r * (1 - r) / n
+            return v ** 0.5
+
+        (pk0, en0), (pk1, en1) = mix(cur_d), mix(new_d)
+        primary, guard, max_drop = self.objective(wid)
+        now = {"pickup_rate": pk0, "engagement_rate": en0}
+        new = {"pickup_rate": pk1, "engagement_rate": en1}
+        noise = {"pickup_rate": se(0), "engagement_rate": se(1)}
+        out = {"pickup_now": round(pk0, 4), "pickup_projected": round(pk1, 4), "engagement_now": round(en0, 4),
+               "engagement_projected": round(en1, 4),
+               "se": {k_: round(v, 4) for k_, v in noise.items()},
+               "pooled": {"pickup": round(p_pick, 4), "engagement": round(p_eng, 4)},
+               "primary_kpi": primary, "guardrail_kpi": guard, "ok": True, "why": "ok"}
+        if new[primary] < now[primary] - P.DID_PRIMARY_TOL - P.DID_PROJ_Z * noise[primary]:
+            out.update(ok=False, why=f"projected {primary} {new[primary]:.3f} < {now[primary]:.3f} "
+                                     f"(beyond {P.DID_PROJ_Z:g} SE = {noise[primary]:.3f})")
+        elif new[guard] < now[guard] - max_drop:
+            out.update(ok=False, why=f"projected {guard} drop {now[guard] - new[guard]:.3f} > max {max_drop}")
+        return out
 
     # ------------------------------------------------------------------ hallucination incidents (C8)
     def halluc(self, wid, cur, credits):
@@ -263,17 +328,22 @@ class Planner:
         w = self.window(wid, P.HALLUC_WINDOW_HOURS, "prompt")
         _, conn, eng, flags = w.get(cp) or (0, 0, 0, 0)
         if inc and inc["status"] == "verifying":
-            since = self.window(wid, (self.s.now_minute - inc["applied_minute"]) // 60 + 1, "prompt").get(cp)
+            since = self.post_change(wid, cp, inc["applied_minute"], inc.get("applied_version"))
             if since and since[1] >= P.VERIFY_MIN_CONNECTED:
                 fr, er = since[3] / since[1], since[2] / since[1]
                 ez = binom_z(since[2], since[1], base["engage"])
+                drop = self.objective(wid)[2] if self.objective(wid)[1] == "engagement_rate" else P.GUARDRAIL_SLACK
                 ok_flags = fr <= limit
-                ok_eng = ez > -2.5
+                # fail only on a drop that is both material (beyond the guardrail) and statistically clear
+                ok_eng = not (er < base["engage"] - drop and ez <= -2)
                 inc.update(status="resolved" if ok_flags and ok_eng else "open", verify={
-                    "flag_rate": round(fr, 4), "engagement": round(er, 3), "engage_z_vs_baseline": round(ez, 2)})
-                if not ok_eng:
+                    "flag_rate": round(fr, 4), "engagement": round(er, 3), "engage_z_vs_baseline": round(ez, 2),
+                    "connected": since[1], "ok_flags": ok_flags, "ok_engagement": ok_eng})
+                if inc["status"] == "open":
                     inc.setdefault("tried", []).append(cp)
                     inc["bad_prompt"] = cp
+                    inc["reopened"] = inc.get("reopened", 0) + 1
+                    inc.pop("candidate", None)
                 self.s.set(f"incident:{wid}", inc)
                 self.s.decide(wid, "incident_verified" if inc["status"] == "resolved" else "incident_reopened",
                               f"after fix {cp}: QA flag rate {fr:.2%} (limit {limit:.2%}), engagement {er:.1%} "
@@ -307,6 +377,10 @@ class Planner:
         if not cand:
             cand = self._pick_fix(wid, inc, credits)
             if not cand:
+                if not inc.get("escalated"):
+                    inc["escalated"] = self.s.now_minute
+                    self.s.decide(wid, "incident_escalated", f"no validated fix for {cp} (tried {inc.get('tried')}); "
+                                  "needs a human: supervisor / on-call notified via the daily summary", inc)
                 self.s.set(f"incident:{wid}", inc)
                 return None
             inc["candidate"] = cand
@@ -319,6 +393,15 @@ class Planner:
                 "impact": 0.9, "api_evidence": {"validation_run_id": cand["validation_run_id"]},
                 "dry_run": {"observed_flag_rate": cand.get("observed"), "validation": cand},
                 "evidence": inc["detected"]}
+
+    def post_change(self, wid, prompt, applied_minute, applied_version):
+        """(dials, conn, eng, flags) for `prompt` using only complete hourly buckets that start at or after the
+        change was applied and calls made on the applied config version or later."""
+        first_h = -(-applied_minute // 60)
+        r = self.s.one("SELECT SUM(dials), SUM(conn), SUM(eng), SUM(flags) FROM agg WHERE wf=? AND prompt=? "
+                       "AND day*24+hour>=? AND day*24+hour<? AND cfg_ver>=?",
+                       (wid, prompt, first_h, self.s.now_minute // 60, applied_version or 0))
+        return None if r[0] is None else r
 
     def _validate(self, wid, pv, credits):
         cache = self.kv(f"validations:{wid}") or {}
@@ -431,9 +514,10 @@ class Planner:
                  "rollback": f"roll back {dim} {ch} -> {control} (winner stopped winning)"}[action]
         rationale = {"start": f"bounded exploration: one challenger, {P.EXPLORE_SHARE:.0%} of traffic, worst case "
                               f"for a 10% worse variant is ~{P.EXPLORE_SHARE * 10:.0f}% x 10% = 1% engagement",
-                     "promote": "challenger beat control on the primary KPI with Bonferroni-corrected one-sided "
-                                "z-test; guardrail within limit",
-                     "stop": "challenger did not beat control (harm or futility stop)",
+                     "promote": f"challenger beat control on the primary KPI "
+                                f"({self.wfs[wid]['objective']['primary']}) with a Bonferroni-corrected one-sided "
+                                "z-test; guardrail KPI within its configured max drop",
+                     "stop": "challenger did not beat control on the primary KPI (harm, guardrail or futility stop)",
                      "rollback": "after promotion the holdout now beats the promoted variant"}[action]
         return {"type": "alloc", "dim": dim, "cohort": "default", "dist": dists[action], "exp_id": exp_id,
                 "action": action, "key": f"exp:{dim}", "summary": words, "rationale": rationale, "impact": impact,
@@ -455,20 +539,48 @@ class Planner:
                 "engagement_projected": round(proj, 4),
                 "assumption": "unseen variants assumed equal to the incumbent"}
 
+    def objective(self, wid) -> tuple[str, str, float]:
+        """(primary KPI, guardrail KPI, max allowed absolute drop of the guardrail) from the workflow's objective."""
+        obj = self.wfs[wid]["objective"]
+        primary = obj["primary"]
+        guard = obj.get("guardrail") or {}
+        other = "engagement_rate" if primary == "pickup_rate" else "pickup_rate"
+        return primary, other, float(guard.get(f"{other}_max_drop", P.GUARDRAIL_SLACK))
+
+    @staticmethod
+    def kpi(name, dials, conn, eng):
+        """(successes, trials) for a KPI: pickup = connected / dials, engagement = engaged / connected."""
+        return (conn, dials) if name == "pickup_rate" else (eng, conn)
+
     def _arm_stats(self, wid, dim, control, ch, version, hours=None):
         col = {"welcome_message": "wm", "voice": "voice"}[dim]
         w = self.since_version(wid, col, version, hours)
         cd, cc, ce, _ = w.get(control) or (0, 0, 0, 0)
         xd, xc, xe, _ = w.get(ch) or (0, 0, 0, 0)
-        primary = self.wfs[wid]["objective"]["primary"]
-        # welcome/voice act after pickup, so they are judged on engagement; pickup is checked as a guardrail
-        z = two_prop_z(xe, xc, ce, cc)
-        return {"control": control, "challenger": ch, "control_conn": cc, "control_eng": ce, "challenger_conn": xc,
-                "challenger_eng": xe, "control_rate": round(ce / cc, 4) if cc else None,
-                "challenger_rate": round(xe / xc, 4) if xc else None, "z": round(z, 3),
-                "rel_lift": round((xe / xc) / (ce / cc) - 1, 4) if cc and xc and ce else None,
-                "pickup_control": round(cc / cd, 4) if cd else None, "pickup_challenger": round(xc / xd, 4) if xd else None,
-                "primary_kpi": primary}
+        primary, guard, max_drop = self.objective(wid)
+        cs, cn = self.kpi(primary, cd, cc, ce)
+        xs, xn = self.kpi(primary, xd, xc, xe)
+        gcs, gcn = self.kpi(guard, cd, cc, ce)
+        gxs, gxn = self.kpi(guard, xd, xc, xe)
+        z = two_prop_z(xs, xn, cs, cn)
+        g_ctl, g_ch = rate(gcs, gcn), rate(gxs, gxn)
+        return {"control": control, "challenger": ch, "primary_kpi": primary, "guardrail_kpi": guard,
+                "guardrail_max_drop": max_drop,
+                "control_n": cn, "control_x": cs, "challenger_n": xn, "challenger_x": xs,
+                "control_rate": round(cs / cn, 4) if cn else None,
+                "challenger_rate": round(xs / xn, 4) if xn else None, "z": round(z, 3),
+                "rel_lift": round((xs / xn) / (cs / cn) - 1, 4) if cn and xn and cs else None,
+                "guardrail_control": round(g_ctl, 4) if g_ctl is not None else None,
+                "guardrail_challenger": round(g_ch, 4) if g_ch is not None else None,
+                "guardrail_z": round(two_prop_z(gxs, gxn, gcs, gcn), 3),
+                "control_conn": cc, "challenger_conn": xc, "control_dials": cd, "challenger_dials": xd}
+
+    @staticmethod
+    def guardrail_ok(st) -> bool:
+        """The challenger's guardrail KPI must be measurable and not more than max_drop below control."""
+        if st["guardrail_control"] is None or st["guardrail_challenger"] is None:
+            return False
+        return st["guardrail_challenger"] >= st["guardrail_control"] - st["guardrail_max_drop"]
 
     def _exp_step(self, wid, cur, exp_id, dim, control, ch, share, status, start_version, result):
         if status.startswith("want_"):
@@ -479,14 +591,18 @@ class Planner:
             st = self._arm_stats(wid, dim, control, ch, start_version)
             k = max(len(self.wfs[wid]["options"][dim]) - 1, 1)
             zc = norm_ppf(1 - P.FAMILY_ALPHA / k)
-            guard_ok = st["pickup_control"] is None or st["pickup_challenger"] is None or \
-                st["pickup_challenger"] >= st["pickup_control"] - P.GUARDRAIL_SLACK
+            # sample sizes are counted in the primary KPI's trials (dials for pickup, connected calls for engagement)
+            scale = P.PICKUP_TRIALS_FACTOR if st["primary_kpi"] == "pickup_rate" else 1
+            n = st["challenger_n"]
+            guard_ok = self.guardrail_ok(st)
             verdict = None
-            if st["challenger_conn"] >= P.HARM_MIN_CONNECTED and st["z"] <= P.HARM_Z:
+            if n >= P.HARM_MIN_CONNECTED * scale and st["z"] <= P.HARM_Z:
                 verdict, action = "harm", "stop"
-            elif st["challenger_conn"] >= P.MIN_ARM_CONNECTED and st["z"] >= zc and guard_ok:
+            elif n >= P.HARM_MIN_CONNECTED * scale and st["guardrail_z"] <= P.GUARD_STOP_Z and not guard_ok:
+                verdict, action = "guardrail_breach", "stop"
+            elif n >= P.MIN_ARM_CONNECTED * scale and st["z"] >= zc and guard_ok:
                 verdict, action = "win", "promote"
-            elif st["challenger_conn"] >= P.FUTILITY_CONNECTED:
+            elif n >= P.FUTILITY_CONNECTED * scale:
                 verdict, action = "no_effect", "stop"
             if not verdict:
                 return None
@@ -494,17 +610,29 @@ class Planner:
             self.s.db.execute("UPDATE experiments SET status=?, result=? WHERE exp_id=?",
                               (f"want_{action}", json.dumps({"verdict": verdict, "stats": st}), exp_id))
             self.s.decide(wid, f"experiment_{verdict}", f"{exp_id}: {ch} {st['challenger_rate']} vs {control} "
-                          f"{st['control_rate']} (z={st['z']}, crit {st['z_crit']}, n={st['challenger_conn']})", st)
+                          f"{st['control_rate']} on {st['primary_kpi']} (z={st['z']}, crit {st['z_crit']}, n={n}); guardrail "
+                          f"{st['guardrail_kpi']} {st['guardrail_challenger']} vs {st['guardrail_control']}", st)
             return self._exp_intent(wid, exp_id, dim, control, ch, action, st)
         if status == "promoted":
             res = json.loads(result or "{}")
             st = self._arm_stats(wid, dim, control, ch, res.get("promote_version") or start_version,
                                  P.DECAY_WINDOW_HOURS)
-            if st["control_conn"] >= P.DECAY_MIN_CONNECTED and st["z"] <= P.DECAY_Z:
+            scale = P.PICKUP_TRIALS_FACTOR if st["primary_kpi"] == "pickup_rate" else 1
+            if st["control_n"] >= P.DECAY_MIN_CONNECTED * scale and st["z"] <= P.DECAY_Z:
+                # rolling back moves traffic to the holdout, so the holdout must pass the guardrail against the winner
+                g_hold, g_win = st["guardrail_control"], st["guardrail_challenger"]
+                if g_hold is not None and g_win is not None and g_hold < g_win - st["guardrail_max_drop"]:
+                    if not res.get("rollback_blocked"):
+                        res["rollback_blocked"] = st
+                        self.s.db.execute("UPDATE experiments SET result=? WHERE exp_id=?", (json.dumps(res), exp_id))
+                        self.s.decide(wid, "rollback_blocked", f"{exp_id}: holdout {control} leads on {st['primary_kpi']} "
+                                      f"(z={st['z']}) but its {st['guardrail_kpi']} {g_hold} is more than "
+                                      f"{st['guardrail_max_drop']} below {ch} {g_win}; keeping {ch}", st)
+                    return None
                 res["decay"] = st
                 self.s.db.execute("UPDATE experiments SET status='want_rollback', result=? WHERE exp_id=?",
                                   (json.dumps(res), exp_id))
                 self.s.decide(wid, "decay_detected", f"{exp_id}: promoted {ch} now {st['challenger_rate']} vs "
-                              f"holdout {control} {st['control_rate']} over {P.DECAY_WINDOW_HOURS}h (z={st['z']})", st)
+                              f"holdout {control} {st['control_rate']} on {st['primary_kpi']} over {P.DECAY_WINDOW_HOURS}h (z={st['z']})", st)
                 return self._exp_intent(wid, exp_id, dim, control, ch, "rollback", st)
         return None

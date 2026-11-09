@@ -17,6 +17,7 @@ GUARDRAIL_SLACK = 0.02        # absolute drop allowed on the guardrail KPI
 DECAY_WINDOW_HOURS = 36
 DECAY_MIN_CONNECTED = 150
 DECAY_Z = -2.0
+PICKUP_TRIALS_FACTOR = 3     # pickup tests count dials (~3 per connected call), so sample thresholds scale up
 
 # caller ID
 DID_WINDOW_HOURS = 6
@@ -27,6 +28,11 @@ DID_PROBE_SHARE = 0.02
 DID_EXPLORE_SHARE = 0.10
 DID_MIN_TV_TO_ACT = 0.05
 DID_COOLDOWN_MIN = 120
+DID_MIN_NEW_DIALS = 150       # new dials on the workflow needed since the last caller-ID change before another
+DID_PRIOR_DIALS = 200         # shrink per-number rates toward the pooled workflow rate with this many pseudo-dials
+DID_PRIMARY_TOL = 0.005       # largest projected absolute drop of the primary KPI a caller-ID change may cost
+DID_PROJ_Z = 2.0              # ...and only when that projected drop is also beyond 2 standard errors of noise
+GUARD_STOP_Z = -3.0           # a guardrail breach alone stops a test only on strong evidence (it is checked every tick)
 
 # hallucination
 HALLUC_WINDOW_HOURS = 8
