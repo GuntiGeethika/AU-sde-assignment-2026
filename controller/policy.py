@@ -6,7 +6,7 @@ TENANT_OVERRIDES = {
 }
 
 # experiments
-EXPLORE_SHARE = 0.10          # traffic share given to a single challenger arm
+EXPLORE_SHARE = 0.08          # traffic share given to a single challenger arm
 HOLDOUT_SHARE = 0.10          # share kept on the old control after promotion (decay detection)
 MIN_ARM_CONNECTED = 250       # minimum connected calls in the challenger arm before a win can be declared
 HARM_MIN_CONNECTED = 100      # earliest point we stop an arm for looking worse
@@ -32,6 +32,7 @@ DID_COOLDOWN_MIN = 120
 HALLUC_WINDOW_HOURS = 8
 HALLUC_MIN_CONNECTED = 150
 HALLUC_Z = 3.0
+HALLUC_Z_ESTABLISHED = 5.0
 VALIDATION_N = 200
 CREDIT_RESERVE = 10
 VERIFY_MIN_CONNECTED = 300

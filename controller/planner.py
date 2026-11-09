@@ -283,6 +283,16 @@ class Planner:
         if not inc or inc["status"] == "resolved":
             if conn < P.HALLUC_MIN_CONNECTED or flags / conn <= limit or binom_z(flags, conn, p0) < P.HALLUC_Z:
                 return None
+            # An 8h spike on a prompt with a long clean record is usually noise: demand a much stronger signal.
+            ac, af = self.s.one("SELECT SUM(conn), SUM(flags) FROM agg WHERE wf=? AND prompt=?", (wid, cp))
+            if ac and ac >= 3 * conn and af / ac <= limit and binom_z(flags, conn, p0) < P.HALLUC_Z_ESTABLISHED:
+                key = f"halluc_noise:{wid}:{self.s.now_minute // 1440}"
+                if not self.kv(key):
+                    self.s.set(key, 1)
+                    self.s.decide(wid, "incident_suppressed", f"{cp} spike {flags}/{conn} in {P.HALLUC_WINDOW_HOURS}h "
+                                  f"but {af}/{ac} = {af / ac:.2%} over its whole run; watching",
+                                  {"window": [flags, conn], "lifetime": [af, ac]})
+                return None
             inc = {"status": "open", "bad_prompt": cp, "opened_minute": self.s.now_minute, "tried": [cp],
                    "detected": {"flags": flags, "connected": conn, "rate": round(flags / conn, 4), "baseline": p0,
                                 "z": round(binom_z(flags, conn, p0), 2)}}
