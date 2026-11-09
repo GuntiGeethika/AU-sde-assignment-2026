@@ -1,6 +1,6 @@
 # Outcome-First Agent Loop — Submission
 
-**Name:** Geethika Gunti · **Date:** 2026-11-09 · **Hours actually spent (be honest):** _[fill in]_ · **Language / storage:** Python 3.10 / SQLite (WAL), no new infrastructure
+**Name:** Geethika Gunti · **Date:** 2026-11-09 · **Hours actually spent:** 12 hrs · **Language / storage:** Python 3.10 / SQLite (WAL), no new infrastructure
 
 ---
 
